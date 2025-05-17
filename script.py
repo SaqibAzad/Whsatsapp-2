@@ -4,13 +4,20 @@ import requests
 import time
 import random
 import json
+import base64
+import hashlib
+import hmac
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.backends import default_backend
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 from openai import OpenAI
+import io
+from PIL import Image
 
 # Hardcoded API tokens and IDs
 WASENDER_API_TOKEN = "84fc8b481b469bea9e321894b5acc3fe9efdd14ad3ab858c152a811559d46938"
-OPENAI_API_KEY = "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"
+OPENAI_API_KEY = ""
 ASSISTANT_ID = "asst_wBPPsAtj5GX3tWmaMKZ1JTQl"
 
 # Still load any other environment variables that might be needed
@@ -20,11 +27,15 @@ app = Flask(__name__)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Directory for storing conversations
+# Directory for storing conversations and media
 CONVERSATIONS_DIR = 'conversations'
-if not os.path.exists(CONVERSATIONS_DIR):
-    os.makedirs(CONVERSATIONS_DIR)
-    logging.info(f"Created conversations directory at {CONVERSATIONS_DIR}")
+MEDIA_DIR = 'media'
+
+# Create directories if they don't exist
+for directory in [CONVERSATIONS_DIR, MEDIA_DIR]:
+    if not os.path.exists(directory):
+        os.makedirs(directory)
+        logging.info(f"Created directory at {directory}")
 
 # API endpoint for sending WhatsApp messages
 WASENDER_API_URL = "https://wasenderapi.com/api/send-message"
@@ -99,6 +110,137 @@ def save_conversation_thread_id(user_id, thread_id):
     except Exception as e:
         logging.error(f"Error saving thread ID to {file_path}: {e}")
 
+def base64url_decode(data):
+    """Decodes a base64url encoded string"""
+    return base64.b64decode(data.translate(str.maketrans('-_', '+/')))
+
+def download_file(url):
+    """Downloads a file from a URL"""
+    try:
+        response = requests.get(url, timeout=30)
+        response.raise_for_status()
+        return response.content
+    except Exception as e:
+        logging.error(f"Failed to download file from {url}: {e}")
+        return None
+
+def get_decryption_keys(media_key, media_type='image', length=112):
+    """Generates decryption keys for WhatsApp media"""
+    media_key_decoded = base64.b64decode(media_key)
+    
+    # Map media types to their corresponding info strings
+    info_map = {
+        'image': 'WhatsApp Image Keys',
+        'video': 'WhatsApp Video Keys',
+        'audio': 'WhatsApp Audio Keys',
+        'document': 'WhatsApp Document Keys',
+    }
+    
+    if media_type not in info_map:
+        raise ValueError(f"Invalid media type: {media_type}")
+    
+    info = info_map[media_type]
+    
+    # Implement HKDF key derivation
+    def hmac_sha256(key, msg):
+        return hmac.new(key, msg, hashlib.sha256).digest()
+    
+    # Extract step
+    prk = hmac_sha256(b'\x00' * 32, media_key_decoded)
+    
+    # Expand step
+    t = b""
+    okm = b""
+    for i in range(1, (length // 32) + 2):
+        t = hmac_sha256(prk, t + info.encode('utf-8') + bytes([i]))
+        okm += t
+    
+    return okm[:length]
+
+def decrypt_whatsapp_media(media_key, enc_file, media_type='image'):
+    """Decrypts a WhatsApp media file"""
+    try:
+        # Get decryption keys based on media type
+        keys = get_decryption_keys(media_key, media_type)
+        iv = keys[:16]
+        cipher_key = keys[16:48]
+        
+        # Remove the last 10 bytes (MAC) from the encrypted file
+        ciphertext = enc_file[:-10]
+        
+        # Decrypt using AES-256-CBC
+        cipher = Cipher(algorithms.AES(cipher_key), modes.CBC(iv), backend=default_backend())
+        decryptor = cipher.decryptor()
+        plaintext = decryptor.update(ciphertext) + decryptor.finalize()
+        
+        return plaintext
+    except Exception as e:
+        logging.error(f"Failed to decrypt media: {e}")
+        return None
+
+def handle_media_message(message_info):
+    """Processes media messages from WhatsApp webhook"""
+    message = message_info.get('message', {})
+    
+    # Determine the media type and extract media information
+    media_info = None
+    media_type = None
+    extension = None
+    
+    if 'imageMessage' in message:
+        media_info = message['imageMessage']
+        media_type = 'image'
+        extension = '.jpg'
+    elif 'videoMessage' in message:
+        media_info = message['videoMessage']
+        media_type = 'video'
+        extension = '.mp4'
+    elif 'audioMessage' in message:
+        media_info = message['audioMessage']
+        media_type = 'audio'
+        extension = '.ogg'
+    elif 'documentMessage' in message:
+        media_info = message['documentMessage']
+        media_type = 'document'
+        extension = ''  # Use the original extension if available
+    else:
+        # Not a media message
+        return None, None
+    
+    # Extract required information
+    media_key = media_info.get('mediaKey')
+    url = media_info.get('url')
+    message_id = message_info.get('key', {}).get('id', 'unknown')
+    caption = media_info.get('caption', '')
+    
+    if not media_key or not url:
+        logging.error(f"Missing media key or URL for message {message_id}")
+        return None, caption
+    
+    # Create a unique filename
+    output_path = os.path.join(MEDIA_DIR, f"{message_id}{extension}")
+    
+    try:
+        # Download the encrypted file
+        enc_file = download_file(url)
+        if not enc_file:
+            return None, caption
+        
+        # Decrypt the file
+        decrypted_file = decrypt_whatsapp_media(media_key, enc_file, media_type)
+        if not decrypted_file:
+            return None, caption
+        
+        # Save the decrypted file
+        with open(output_path, 'wb') as f:
+            f.write(decrypted_file)
+        
+        logging.info(f"Successfully saved decrypted {media_type} to {output_path}")
+        return output_path, caption
+    except Exception as e:
+        logging.error(f"Error handling media message: {e}")
+        return None, caption
+
 def split_message(text, max_lines=3, max_chars_per_line=100):
     """Split a long message into smaller chunks for better WhatsApp readability."""
     # First split by existing newlines
@@ -148,8 +290,8 @@ def split_message(text, max_lines=3, max_chars_per_line=100):
     
     return chunks
 
-def get_openai_assistant_response(message_text, user_id):
-    """Generates a response from OpenAI Assistant API."""
+def get_openai_assistant_response(message_text, user_id, image_path=None):
+    """Generates a response from OpenAI Assistant API with optional image."""
     try:
         logging.info(f"Getting response from OpenAI Assistant for user {user_id}")
         
@@ -178,13 +320,52 @@ def get_openai_assistant_response(message_text, user_id):
                 logging.info(f"Created replacement thread {thread_id} for user {user_id}")
         
         # Add the user message to the thread
-        logging.info(f"Adding message to thread {thread_id}: {message_text[:50]}...")
-        message = client.beta.threads.messages.create(
-            thread_id=thread_id,
-            role="user",
-            content=message_text
-        )
-        logging.info(f"Added message {message.id} to thread {thread_id}")
+        if image_path:
+            # For image messages, send both the image and any caption
+            logging.info(f"Adding message with image to thread {thread_id}: {image_path}")
+            
+            # Prepare the image file
+            with open(image_path, "rb") as image_file:
+                file = client.files.create(
+                    file=image_file,
+                    purpose="assistants"
+                )
+                
+            # Add message with image attachment - FIXED CODE HERE
+            # Create message content with both text and image file reference
+            message_content = []
+            
+            # Add text content if there's a message/caption
+            if message_text:
+                message_content.append({
+                    "type": "text", 
+                    "text": message_text
+                })
+            
+            # Add image file reference
+            message_content.append({
+                "type": "image_file",
+                "image_file": {
+                    "file_id": file.id
+                }
+            })
+                
+            # Create the message with the content array
+            message = client.beta.threads.messages.create(
+                thread_id=thread_id,
+                role="user",
+                content=message_content
+            )
+            logging.info(f"Added message with image {file.id} to thread {thread_id}")
+        else:
+            # For text-only messages
+            logging.info(f"Adding text message to thread {thread_id}: {message_text[:50]}...")
+            message = client.beta.threads.messages.create(
+                thread_id=thread_id,
+                role="user",
+                content=message_text
+            )
+            logging.info(f"Added message {message.id} to thread {thread_id}")
         
         # Run the assistant on the thread
         logging.info(f"Running assistant {ASSISTANT_ID} on thread {thread_id}")
@@ -246,8 +427,8 @@ def get_openai_assistant_response(message_text, user_id):
         logging.error(f"Error calling OpenAI Assistant API: {e}", exc_info=True)
         return "I'm having trouble processing your request. Please try again later."
 
-def send_whatsapp_message(recipient_number, message_content, message_type='text', media_url=None):
-    """Sends a message via WaSenderAPI. Supports text and media messages."""
+def send_whatsapp_message(recipient_number, message_content, message_type='text'):
+    """Sends a message via WaSenderAPI. Supports text messages only."""
     # Use the hardcoded token directly
     token = WASENDER_API_TOKEN
     
@@ -266,32 +447,15 @@ def send_whatsapp_message(recipient_number, message_content, message_type='text'
     else:
         formatted_recipient_number = recipient_number
 
-    payload = {
-        'to': formatted_recipient_number
-    }
-
-    if message_type == 'text':
-        payload['text'] = message_content
-    elif message_type == 'image' and media_url:
-        payload['imageUrl'] = media_url
-        if message_content:
-            payload['text'] = message_content 
-    elif message_type == 'video' and media_url:
-        payload['videoUrl'] = media_url
-        if message_content:
-            payload['text'] = message_content
-    elif message_type == 'audio' and media_url:
-        payload['audioUrl'] = media_url
-    elif message_type == 'document' and media_url:
-        payload['documentUrl'] = media_url
-        if message_content:
-            payload['text'] = message_content
-    else:
-        if message_type != 'text':
-             logging.error(f"Media URL is required for message type '{message_type}'.")
-             return False
-        logging.error(f"Unsupported message type or missing content/media_url: {message_type}")
+    # Only support text messages
+    if message_type != 'text':
+        logging.error(f"Unsupported message type: {message_type}. Only text messages are supported.")
         return False
+
+    payload = {
+        'to': formatted_recipient_number,
+        'text': message_content
+    }
     
     logging.debug(f"Attempting to send WhatsApp message. Payload: {payload}")
 
@@ -311,6 +475,9 @@ def send_whatsapp_message(recipient_number, message_content, message_type='text'
         logging.error(f"An unexpected error occurred while sending WhatsApp message: {e}")
         return False
 
+# Authorized phone number for testing
+AUTHORIZED_NUMBER = "923165893850"
+
 @app.route('/webhook', methods=['POST'])
 def webhook():
     """Handles incoming WhatsApp messages via webhook."""
@@ -327,63 +494,93 @@ def webhook():
                 return jsonify({'status': 'success', 'message': 'Self-sent message ignored'}), 200
 
             sender_number = message_info.get('key', {}).get('remoteJid')
+            message_id = message_info.get('key', {}).get('id', f"msg_{int(time.time())}")
             
-            incoming_message_text = None
-            message_type = 'unknown'
-
-            # Extract message content based on message structure
-            if message_info.get('message'):
-                msg_content_obj = message_info['message']
-                if 'conversation' in msg_content_obj:
-                    incoming_message_text = msg_content_obj['conversation']
-                    message_type = 'text'
-                elif 'extendedTextMessage' in msg_content_obj and 'text' in msg_content_obj['extendedTextMessage']:
-                    incoming_message_text = msg_content_obj['extendedTextMessage']['text']
-                    message_type = 'text'
-
-            if message_info.get('messageStubType'):
-                stub_params = message_info.get('messageStubParameters', [])
-                logging.info(f"Received system message of type {message_info['messageStubType']} from {sender_number}. Stub params: {stub_params}")
-                return jsonify({'status': 'success', 'message': 'System message processed'}), 200
-
-            if not sender_number:
+            # Check if the sender is the authorized number
+            # Extract the phone number from the JID format (may be number@s.whatsapp.net)
+            if sender_number:
+                phone_number = sender_number.split('@')[0] if '@' in sender_number else sender_number
+                
+                # Log all incoming messages but only process authorized number
+                if phone_number != AUTHORIZED_NUMBER:
+                    logging.info(f"Ignoring message from unauthorized number: {phone_number}")
+                    return jsonify({'status': 'success', 'message': 'Unauthorized sender ignored'}), 200
+                else:
+                    logging.info(f"Processing message from authorized number: {phone_number}")
+            else:
                 logging.warning("Webhook received message without sender information.")
                 return jsonify({'status': 'error', 'message': 'Incomplete sender data'}), 400
-
-            # Sanitize sender_number to use as a filename/user_id
-            safe_sender_id = "".join(c if c.isalnum() else '_' for c in sender_number)
-
-            if message_type == 'text' and incoming_message_text:
-                logging.info(f"Processing text message from {sender_number} ({safe_sender_id}): {incoming_message_text}")
+            
+            # Create a safe version of the sender ID for thread management
+            safe_sender_id = phone_number.replace('+', '').replace(' ', '')
+            
+            # Check if this is a media message
+            media_path = None
+            caption = None
+            incoming_message_text = None
+            
+            if message_info.get('message'):
+                msg_content_obj = message_info['message']
                 
-                # Get OpenAI Assistant's reply
-                assistant_reply = get_openai_assistant_response(incoming_message_text, safe_sender_id)
+                # First try to handle as media message
+                media_path, caption = handle_media_message(message_info)
                 
-                if assistant_reply:
-                    # Split the response into chunks and send them sequentially
-                    message_chunks = split_message(assistant_reply)
-                    for i, chunk in enumerate(message_chunks):
-                        if not send_whatsapp_message(sender_number, chunk, message_type='text'):
-                            logging.error(f"Failed to send message chunk to {sender_number}")
-                            break
-                        # Delay between messages
-                        if i < len(message_chunks) - 1:
-                            delay = random.uniform(0.55, 1.5)
-                            time.sleep(delay)
-            elif incoming_message_text:
-                logging.info(f"Received '{message_type}' message from {sender_number}. No text content. Full data: {message_info}")
-            elif message_type != 'unknown':
-                 logging.info(f"Received '{message_type}' message from {sender_number}. No text content. Full data: {message_info}")
-            else:
-                logging.warning(f"Received unhandled or incomplete message from {sender_number}. Data: {message_info}")
-        elif data.get('event'):
-            logging.info(f"Received event '{data.get('event')}' which is not 'messages.upsert'. Data: {str(data)[:200]}")
-
-        return jsonify({'status': 'success'}), 200
+                # If it's not a media message, handle as text
+                if not media_path:
+                    # Handle text messages
+                    if 'conversation' in msg_content_obj:
+                        incoming_message_text = msg_content_obj['conversation']
+                    elif 'extendedTextMessage' in msg_content_obj and 'text' in msg_content_obj['extendedTextMessage']:
+                        incoming_message_text = msg_content_obj['extendedTextMessage']['text']
+                    else:
+                        # Unsupported message type
+                        logging.info("Received unsupported message type. Ignoring.")
+                        send_whatsapp_message(
+                            sender_number,
+                            "I can only process text and media messages at this time.",
+                            message_type='text'
+                        )
+                        return jsonify({'status': 'success', 'message': 'Unsupported message type ignored'}), 200
+                else:
+                    # If we have media but no caption, set empty text
+                    if not caption:
+                        incoming_message_text = "Please describe this image."
+                    else:
+                        incoming_message_text = caption
+                
+                # Process with OpenAI
+                if media_path or incoming_message_text:
+                    logging.info(f"Processing {'media with caption' if media_path else 'text message'}: {incoming_message_text[:50] if incoming_message_text else ''}")
+                    
+                    # Get AI response
+                    assistant_reply = get_openai_assistant_response(
+                        incoming_message_text, 
+                        safe_sender_id,
+                        image_path=media_path
+                    )
+                    
+                    if assistant_reply:
+                        # Split and send the response
+                        message_chunks = split_message(assistant_reply)
+                        for i, chunk in enumerate(message_chunks):
+                            send_whatsapp_message(sender_number, chunk, message_type='text')
+                            if i < len(message_chunks) - 1:
+                                time.sleep(random.uniform(0.5, 1))
+                    else:
+                        send_whatsapp_message(
+                            sender_number, 
+                            "I'm not sure how to respond to that. Could you please rephrase?", 
+                            message_type='text'
+                        )
+            
+            return jsonify({'status': 'success', 'message': 'Message processed successfully'}), 200
+        
+        return jsonify({'status': 'success', 'message': 'Non-message event ignored'}), 200
+    
     except Exception as e:
-        logging.error(f"Error processing webhook: {e}")
-        return jsonify({'status': 'error', 'message': 'Internal server error'}), 500
+        logging.error(f"Error processing webhook: {e}", exc_info=True)
+        return jsonify({'status': 'error', 'message': 'Error processing webhook'}), 500
 
 if __name__ == '__main__':
-    # For development with webhook testing via ngrok
-    app.run(debug=True, port=5001, host='0.0.0.0')
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=True)
